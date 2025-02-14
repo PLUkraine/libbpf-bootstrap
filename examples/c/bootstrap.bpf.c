@@ -10,102 +10,81 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, 1<<16);
 	__type(key, pid_t);
-	__type(value, u64);
-} exec_start SEC(".maps");
+	__type(value, s32);
+} fd_count SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 256 * 1024);
-} rb SEC(".maps");
+/**
+ * @brief Increment the fd_count by a given value 
+ */
+void handle_open(int increment) {
+	u64 id = bpf_get_current_pid_tgid();
+	pid_t pid = id >> 32;
 
-const volatile unsigned long long min_duration_ns = 0;
+	void *elem = bpf_map_lookup_elem(&fd_count, &pid);
+	s32 value = 0;
+	if (elem) {
+		value = *((s32 *)elem);
+		value += increment;
+	} else {
+		value = increment;
+	}
+	bpf_map_update_elem(&fd_count, &pid, &value, BPF_ANY);
+}
 
-SEC("tp/sched/sched_process_exec")
-int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
-{
-	struct task_struct *task;
-	unsigned fname_off;
-	struct event *e;
-	pid_t pid;
-	u64 ts;
-
-	/* remember time exec() was executed for this PID */
-	pid = bpf_get_current_pid_tgid() >> 32;
-	ts = bpf_ktime_get_ns();
-	bpf_map_update_elem(&exec_start, &pid, &ts, BPF_ANY);
-
-	/* don't emit exec events when minimum duration is specified */
-	if (min_duration_ns)
-		return 0;
-
-	/* reserve sample from BPF ringbuf */
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	/* fill out the sample with data */
-	task = (struct task_struct *)bpf_get_current_task();
-
-	e->exit_event = false;
-	e->pid = pid;
-	e->ppid = BPF_CORE_READ(task, real_parent, tgid);
-	bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-	fname_off = ctx->__data_loc_filename & 0xFFFF;
-	bpf_probe_read_str(&e->filename, sizeof(e->filename), (void *)ctx + fname_off);
-
-	/* successfully submit it to user-space for post-processing */
-	bpf_ringbuf_submit(e, 0);
+/**
+ * @brief Increment the counter on open and openat.
+ * Please note that these syscalls don't cover ALL cases
+ */
+SEC("tracepoint/syscalls/sys_enter_openat")
+int tracepoint__syscalls__sys_enter_openat(struct trace_event_raw_sys_enter *ctx) {
+	handle_open(1);
 	return 0;
 }
 
+/**
+ * @brief Increment the counter on open and openat
+ * Please note that these syscalls don't cover ALL cases
+ */
+SEC("tracepoint/syscalls/sys_enter_open")
+int tracepoint__syscalls__sys_enter_open(struct trace_event_raw_sys_enter *ctx) {
+	handle_open(1);
+	return 0;
+}
+
+/**
+ * @brief Decrement the counter on close
+ */
+SEC("tracepoint/syscalls/sys_enter_close")
+int tracepoint__syscalls__sys_enter_close(struct trace_event_raw_sys_enter *ctx) {
+	handle_open(-1);
+	return 0;
+}
+
+/**
+ * @brief Reset the fd count for a new process
+ */
+SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
+	u64 id = bpf_get_current_pid_tgid();
+	pid_t pid = id >> 32;
+
+	s32 value = 2;
+	bpf_map_update_elem(&fd_count, &pid, &value, BPF_ANY);
+
+	return 0;
+}
+
+/**
+ * Remove process from the map on exit
+ */
 SEC("tp/sched/sched_process_exit")
-int handle_exit(struct trace_event_raw_sched_process_template *ctx)
-{
-	struct task_struct *task;
-	struct event *e;
-	pid_t pid, tid;
-	u64 id, ts, *start_ts, duration_ns = 0;
+int handle_exit(struct trace_event_raw_sched_process_exec *ctx) {
+	u64 id = bpf_get_current_pid_tgid();
+	pid_t pid = id >> 32;
 
-	/* get PID and TID of exiting thread/process */
-	id = bpf_get_current_pid_tgid();
-	pid = id >> 32;
-	tid = (u32)id;
+	bpf_map_delete_elem(&fd_count, &pid);
 
-	/* ignore thread exits */
-	if (pid != tid)
-		return 0;
-
-	/* if we recorded start of the process, calculate lifetime duration */
-	start_ts = bpf_map_lookup_elem(&exec_start, &pid);
-	if (start_ts)
-		duration_ns = bpf_ktime_get_ns() - *start_ts;
-	else if (min_duration_ns)
-		return 0;
-	bpf_map_delete_elem(&exec_start, &pid);
-
-	/* if process didn't live long enough, return early */
-	if (min_duration_ns && duration_ns < min_duration_ns)
-		return 0;
-
-	/* reserve sample from BPF ringbuf */
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	/* fill out the sample with data */
-	task = (struct task_struct *)bpf_get_current_task();
-
-	e->exit_event = true;
-	e->duration_ns = duration_ns;
-	e->pid = pid;
-	e->ppid = BPF_CORE_READ(task, real_parent, tgid);
-	e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
-	bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-	/* send data to user-space for post-processing */
-	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
