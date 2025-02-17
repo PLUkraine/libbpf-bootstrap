@@ -73,6 +73,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	s32 value = 2;
 	bpf_map_update_elem(&fd_count, &pid, &value, BPF_ANY);
 
+	bpf_printk("Process %d created\n", pid);
 	return 0;
 }
 
@@ -86,5 +87,6 @@ int handle_exit(struct trace_event_raw_sched_process_exec *ctx) {
 
 	bpf_map_delete_elem(&fd_count, &pid);
 
+	bpf_printk("Process %d exited\n", pid);
 	return 0;
 }
